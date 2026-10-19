@@ -606,6 +606,89 @@ as they should never be created manually, but they are guaranteed to support two
 .. autoclass:: P2POp
 ```
 
+## One-sided communication (experimental)
+
+```{warning}
+The window API is experimental and may change without notice.
+```
+
+A window exposes a tensor on every rank of a group for one-sided (RMA) writes:
+a rank can write into a peer's tensor with {meth}`~torch.distributed.distributed_c10d.Window.put` without the peer
+posting a matching receive. Peers synchronize with {meth}`~torch.distributed.distributed_c10d.Window.signal` and
+{meth}`~torch.distributed.distributed_c10d.Window.wait_signal`. The `nccl` and `nccl-lazy` backends support
+windows with NCCL 2.29 or later. `nccl-legacy` does not, nor does `nccl`
+when `TORCH_DIST_USE_NCCL2=0` selects the legacy implementation.
+{func}`~torch.distributed.distributed_c10d._supports_window` only checks the backend and NCCL version:
+registration can still fail if no transport between the ranks supports
+symmetric memory (e.g. no NVLink or InfiniBand).
+
+With `nccl`, the window tensor must be allocated from the backend's memory
+pool, `torch.cuda.MemPool(backend.mem_allocator)`. Registration covers the
+tensor's whole allocator segment, so all ranks must register matching
+segments; allocating the same sizes in the same order on every rank satisfies
+this. The source of {meth}`~torch.distributed.distributed_c10d.Window.put` must lie in an already registered
+segment, e.g. a slice of a registered tensor.
+Each {meth}`~torch.distributed.distributed_c10d.Window.put` also signals the destination rank, so the
+destination can wait for the data with a single {meth}`~torch.distributed.distributed_c10d.Window.wait_signal`.
+{meth}`~torch.distributed.distributed_c10d.Window.map_remote_tensor` only supports the local rank, and
+{meth}`~torch.distributed.distributed_c10d.Window.get_attr` always reports `SEPARATE`.
+
+The example below runs a ring: each rank writes its slice into the next rank's
+window and waits for the previous rank's slice to arrive in its own. The
+source is the last slot of the registered buffer.
+
+```python
+import os
+
+import torch
+import torch.distributed as dist
+
+local_rank = int(os.environ["LOCAL_RANK"])
+device = torch.device("cuda", local_rank)
+# MemPool and use_mem_pool use the current device.
+torch.cuda.set_device(device)
+dist.init_process_group("nccl", device_id=device)
+rank, world_size = dist.get_rank(), dist.get_world_size()
+assert dist._supports_window()
+
+backend = dist.get_backend_impl(device=device)
+pool = torch.cuda.MemPool(backend.mem_allocator)
+count = 1024
+with torch.cuda.use_mem_pool(pool):
+    # One slot per rank plus a trailing slot used as the put source.
+    buf = torch.zeros(count * (world_size + 1), dtype=torch.float, device=device)
+
+# Collective: every rank registers its buffer.
+win = dist._new_window(buf)
+src = buf[world_size * count :]
+src.fill_(rank)
+
+next_rank = (rank + 1) % world_size
+prev_rank = (rank - 1) % world_size
+# Write src into slot `rank` of the next rank's buffer and signal it.
+win.put(src, next_rank, rank * count, async_op=False)
+# Wait until the previous rank's put has landed in this rank's buffer.
+win.wait_signal(prev_rank, async_op=False)
+torch.cuda.synchronize()
+assert buf[prev_rank * count : (prev_rank + 1) * count].eq(prev_rank).all()
+
+# Collective: ranks synchronize before releasing the buffer.
+win.tensor_deregister()
+```
+
+All operations return a `Work` handle. With `async_op=False` the operation is
+enqueued on the current stream; with `async_op=True` it is enqueued on an
+internal stream ordered after the current stream, and `Work.wait()` makes the
+current stream wait for it.
+
+```{eval-rst}
+.. autofunction:: torch.distributed.distributed_c10d._supports_window
+.. autofunction:: torch.distributed.distributed_c10d._new_window
+
+.. autoclass:: torch.distributed.distributed_c10d.Window
+   :members:
+```
+
 ## Synchronous and asynchronous collective operations
 
 Every collective operation function supports the following two kinds of operations,
