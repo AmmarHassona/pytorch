@@ -4081,6 +4081,118 @@ class DunderDictVariableTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(cnts.frame_count, 1)
 
 
+class OrderedDictInstanceAttrTests(torch._dynamo.test_case.TestCase):
+    """Instance attributes of collections.OrderedDict."""
+
+    hw_classification = HardwareClassification.GENERIC
+
+    def test_issue_201124_module_state_dict(self):
+        m = torch.nn.Linear(2, 2)
+
+        def f(x):
+            return x + len(m.state_dict())
+
+        x = torch.zeros(1)
+        cnt = torch._dynamo.testing.CompileCounter()
+        opt = torch.compile(f, backend=cnt, fullgraph=True)
+        self.assertEqual(opt(x), f(x))
+        self.assertEqual(cnt.frame_count, 1)
+        self.assertEqual(opt(x), f(x))
+        self.assertEqual(cnt.frame_count, 1)
+
+    def test_issue_201124_in_frame_ordereddict_attr(self):
+        def f(x):
+            d = OrderedDict()
+            d._metadata = 1
+            return x + d._metadata
+
+        x = torch.zeros(1)
+        cnt = torch._dynamo.testing.CompileCounter()
+        opt = torch.compile(f, backend=cnt, fullgraph=True)
+        self.assertEqual(opt(x), f(x))
+        self.assertEqual(cnt.frame_count, 1)
+        self.assertEqual(opt(x), f(x))
+        self.assertEqual(cnt.frame_count, 1)
+
+    def test_state_dict_values_order_and_metadata(self):
+        class Inner(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lin = torch.nn.Linear(3, 4)
+                self.buf = torch.nn.Buffer(torch.arange(5, dtype=torch.float32))
+
+            def forward(self, x):
+                return self.lin(x)
+
+        class Outer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.inner = Inner()
+                self.head = torch.nn.Linear(4, 2)
+
+            def forward(self, x):
+                return self.head(self.inner(x))
+
+        model = Outer()
+
+        def f(x):
+            return model.state_dict()
+
+        def check(res, ref):
+            self.assertIs(type(res), type(ref))
+            self.assertEqual(list(res.keys()), list(ref.keys()))
+            for key in ref:
+                self.assertEqual(res[key], ref[key])
+            self.assertIs(type(res._metadata), type(ref._metadata))
+            self.assertEqual(list(res._metadata.keys()), list(ref._metadata.keys()))
+            for key in ref._metadata:
+                self.assertEqual(dict(res._metadata[key]), dict(ref._metadata[key]))
+
+        x = torch.zeros(1)
+        cnt = torch._dynamo.testing.CompileCounter()
+        opt = torch.compile(f, backend=cnt, fullgraph=True)
+        check(opt(x), f(x))
+        self.assertEqual(cnt.frame_count, 1)
+        check(opt(x), f(x))
+        self.assertEqual(cnt.frame_count, 1)
+
+    def test_sourced_ordereddict_instance_attr_declines(self):
+        od = OrderedDict(a=1)
+        od.foo = 7
+        x = torch.zeros(1)
+
+        def read_attr(x, d):
+            return x + d.foo
+
+        with self.assertRaisesRegex(
+            Unsupported,
+            "getattr\\(\\) on a pre-existing OrderedDict instance attribute",
+        ):
+            torch.compile(read_attr, backend="eager", fullgraph=True)(x, od)
+        # Without fullgraph the frame falls back to eager and matches.
+        self.assertEqual(torch.compile(read_attr, backend="eager")(x, od), x + 7)
+
+        def write_attr(x, d):
+            d.foo = 1
+            return x + len(d)
+
+        with self.assertRaisesRegex(
+            Unsupported, "setattr\\(\\) on a pre-existing OrderedDict"
+        ):
+            torch.compile(write_attr, backend="eager", fullgraph=True)(x, od)
+        self.assertEqual(
+            torch.compile(write_attr, backend="eager")(x, OrderedDict(a=1)), x + 1
+        )
+
+        def dict_view(x, d):
+            return x + len(d.__dict__)
+
+        with self.assertRaisesRegex(
+            Unsupported, "__dict__ access on a pre-existing OrderedDict"
+        ):
+            torch.compile(dict_view, backend="eager", fullgraph=True)(x, od)
+
+
 instantiate_parametrized_tests(DictGuardTests)
 
 
