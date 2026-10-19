@@ -113,6 +113,23 @@ def _real_dep_names(deps: OrderedSet[Dep]) -> OrderedSet[str]:
     return OrderedSet(dep.name for dep in deps if not isinstance(dep, WeakDep))
 
 
+def _written_buffer_names(writes: OrderedSet[Dep]) -> OrderedSet[str]:
+    """Names of buffers written by `writes`, including the ConcatKernel buffer a
+    NonOwningLayout cat input writes in place. The cat buffer writes are kept out
+    of read_writes: there they would satisfy reads of the cat buffer in fusion
+    even though codegen does not forward a store to the alias to a load of the
+    cat buffer."""
+    names = _real_dep_names(writes)
+    for name in list(names):
+        buf = V.graph.name_to_buffer.get(name)
+        if buf is None or not isinstance(buf.layout, ir.NonOwningLayout):
+            continue
+        cat_name = buf.layout.view.get_name()
+        if isinstance(V.graph.name_to_buffer.get(cat_name), ir.ConcatKernel):
+            names.add(cat_name)
+    return names
+
+
 fusion_log = torch._logging.getArtifactLogger(__name__, "fusion")
 loop_ordering_log = torch._logging.getArtifactLogger(__name__, "loop_ordering")
 compute_dependencies_log = torch._logging.getArtifactLogger(
@@ -12014,13 +12031,33 @@ class Scheduler:
 
             return False
 
-        for partition, skip_cudagraph in zip(
-            reversed(partitions), reversed(skip_cudagraphs)
+        # A buffer is defined (allocated and returned) by the first partition that
+        # writes it. This is usually its producer's partition, but cat inputs are
+        # written in place into the cat buffer before the ConcatKernel node.
+        first_writer: dict[str, int] = {}
+        for idx, partition in enumerate(partitions):
+            for node in partition:
+                for name in _written_buffer_names(node.read_writes.writes):
+                    if name in self.name_to_buf:
+                        first_writer.setdefault(name, idx)
+        first_written: list[OrderedSet[str]] = [OrderedSet() for _ in partitions]
+        for name, idx in first_writer.items():
+            first_written[idx].add(name)
+
+        for idx, partition, skip_cudagraph in zip(
+            reversed(range(len(partitions))),
+            reversed(partitions),
+            reversed(skip_cudagraphs),
         ):
             output_names: OrderedSet[str] = OrderedSet()
 
             for node in partition:
                 output_names.update(node.outputs_by_name.keys())
+
+            output_names.update(first_written[idx])
+            output_names = OrderedSet(
+                name for name in output_names if first_writer.get(name, idx) == idx
+            )
 
             returned_output_names = output_names.intersection(unmet_output_names)
 
