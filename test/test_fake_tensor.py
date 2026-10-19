@@ -4432,9 +4432,10 @@ class TestFakeTensorDispatchCache(TestCase):
                 lambda: torch.ops.aten.index(x, [None, idx_tensor1]),
             )
 
+            # int8 is not a valid index dtype; eager raises too
             idx_tensor1 = torch.tensor([1, -2, 3, -4], dtype=torch.int8)
             self.assertRaises(
-                DynamicOutputShapeException,
+                IndexError,
                 lambda: torch.ops.aten.index(x, [None, idx_tensor1]),
             )
 
