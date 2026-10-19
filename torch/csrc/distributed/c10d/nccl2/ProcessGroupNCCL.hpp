@@ -757,7 +757,9 @@ class TORCH_API ProcessGroupNCCL : public ::c10d::Backend {
   // Active coalescing batch (port of BackendWrapper). Engaged between
   // startCoalescing() and endCoalescing(); send()/recv() append into it.
   std::optional<BatchSendRecv> coalescing_batch_;
-  c10::intrusive_ptr<WorkNCCL> coalesced_work_;
+  // Works enqueued while coalescing_batch_ is engaged; endCoalescing()
+  // returns a work covering all of them.
+  std::vector<c10::intrusive_ptr<WorkNCCL>> coalescing_works_;
 
   // Configs issued between startTimeEstimate() and endTimeEstimate().
   bool time_estimate_active_ = false;
